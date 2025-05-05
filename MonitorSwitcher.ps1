@@ -14,15 +14,17 @@ $global:keyboardConnected = $false
 $global:logName = "Application"
 $global:source = "MonitorSwitcher"
 
-
-# Create event source if it doesn't exist
-if (-not (Get-EventLog -LogName $global:logName | Where-Object { $_.Source -eq $global:source })) {
-    New-EventLog -LogName $global:logName -Source $global:source
+try {
+    # Create event source if it doesn't exist
+	if (-not (Get-EventLog -LogName $global:logName | Where-Object { $_.Source -eq $global:source })) {
+		New-EventLog -LogName $global:logName -Source $global:source
+	}
+} catch {
+	Write-Host "Error creating event source"
 }
 
 function SwitchToModeA {
     try {
-        ActivateMonitor
         New-BurntToastNotification -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeA_monitor_output_id
     } catch {
@@ -51,15 +53,6 @@ function IsConnected {
         Write-Host "Error checking if keyboard is connected: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1003 -Message "Error checking if keyboard is connected: $_"
         return $false
-    }
-}
-
-function ActivateMonitor {
-    try {
-        (Add-Type '[DllImport("user32.dll")]public static extern int SendMessage(int hWnd, int hMsg, int wParam, int lParam);' -Name a -Pas)::SendMessage(-1,0x0112,0xF170,-1)
-    } catch {
-        Write-Host "Error activating monitor: $_"
-        Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1004 -Message "Error activating monitor: $_"
     }
 }
 
