@@ -1,10 +1,15 @@
 # Load notification module
 Import-Module BurntToast
 
+$global:icon = Join-Path $PSScriptRoot "MonitorDual.png"
+
 $global:keyboardId = "VID_046D&PID_C31C" # Use this in PowerShell -> Get-PnpDevice -Class "USB" | Select-Object Name, InstanceId
 $global:monitorId = "\\.\DISPLAY1\Monitor0" # Get this from ControlMyMonitor
+$global:monitor2Id = "\\.\DISPLAY2\Monitor0" # Get this from ControlMyMonitor
 $global:modeA_monitor_output_id = 15 #HDMI, DP, ETC... Get this from ControlMyMonitor
+$global:modeA_monitor2_output_id = 15 #HDMI, DP, ETC... Get this from ControlMyMonitor
 $global:modeB_monitor_output_id = 17 #HDMI, DP, ETC... Get this from ControlMyMonitor
+$global:modeB_monitor2_output_id = 17 #HDMI, DP, ETC... Get this from ControlMyMonitor
 
 
 $global:modeA_msg = "MODE A ENABLED"
@@ -25,8 +30,9 @@ try {
 
 function SwitchToModeA {
     try {
-        New-BurntToastNotification -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
+        New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeA_monitor_output_id
+        & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeA_monitor2_output_id
     } catch {
         Write-Host "Error switching to Mode A: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1001 -Message "Error switching to Mode A: $_"
@@ -35,8 +41,9 @@ function SwitchToModeA {
 
 function SwitchToModeB {
     try {
-        New-BurntToastNotification -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
+        New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeB_monitor_output_id
+        & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeB_monitor2_output_id
     } catch {
         Write-Host "Error switching to Mode B: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1002 -Message "Error switching to Mode B: $_"
