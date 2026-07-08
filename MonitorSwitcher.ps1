@@ -23,7 +23,7 @@ $global:source = "MonitorSwitcher"
 # other input on its own. Set this to your Windows "turn off display" timeout (in
 # seconds). When the user comes back after being idle at least this long, the
 # script reapplies the current mode so the monitor switches back to the right input.
-$global:displaySleepThresholdSec = 60
+$global:displaySleepThresholdSec = 900
 # How often (seconds) the loop wakes up to poll for a screen wake-up.
 $global:pollIntervalSec = 2
 
