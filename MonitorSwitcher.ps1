@@ -19,6 +19,35 @@ $global:keyboardConnected = $false
 $global:logName = "Application"
 $global:source = "MonitorSwitcher"
 
+# When the screen sleeps by inactivity the monitor loses signal and jumps to the
+# other input on its own. Set this to your Windows "turn off display" timeout (in
+# seconds). When the user comes back after being idle at least this long, the
+# script reapplies the current mode so the monitor switches back to the right input.
+$global:displaySleepThresholdSec = 60
+# How often (seconds) the loop wakes up to poll for a screen wake-up.
+$global:pollIntervalSec = 2
+
+# P/Invoke to read how long the user has been idle (no keyboard/mouse input).
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class IdleInfo {
+    [StructLayout(LayoutKind.Sequential)]
+    struct LASTINPUTINFO {
+        public uint cbSize;
+        public uint dwTime;
+    }
+    [DllImport("user32.dll")]
+    static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    public static uint GetIdleSeconds() {
+        LASTINPUTINFO lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)Marshal.SizeOf(lii);
+        if (!GetLastInputInfo(ref lii)) { return 0; }
+        return (uint)(((uint)Environment.TickCount - lii.dwTime) / 1000);
+    }
+}
+"@
+
 try {
     # Create event source if it doesn't exist
 	if (-not (Get-EventLog -LogName $global:logName | Where-Object { $_.Source -eq $global:source })) {
@@ -29,8 +58,11 @@ try {
 }
 
 function SwitchToModeA {
+    param([switch]$Silent)
     try {
-        New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
+        if (-not $Silent) {
+            New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
+        }
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeA_monitor_output_id
         & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeA_monitor2_output_id
     } catch {
@@ -40,8 +72,11 @@ function SwitchToModeA {
 }
 
 function SwitchToModeB {
+    param([switch]$Silent)
     try {
-        New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
+        if (-not $Silent) {
+            New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
+        }
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeB_monitor_output_id
         & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeB_monitor2_output_id
     } catch {
@@ -95,25 +130,46 @@ try {
 
 Write-Host "Keyboard status monitor started. Waiting for events..."
 
+$global:previousIdleSec = [IdleInfo]::GetIdleSeconds()
+
 try {
     while ($true) {
+        # Poll with a timeout so we can also detect display wake-ups (which don't
+        # raise any device event). A keyboard event just makes this return sooner.
         try {
-            Wait-Event -SourceIdentifier "KeyboardEvent" | Out-Null
+            Wait-Event -SourceIdentifier "KeyboardEvent" -Timeout $global:pollIntervalSec | Out-Null
         } catch {
             Write-Host "Error waiting for event: $_"
             Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1008 -Message "Error waiting for event: $_"
             break
         }
 
-        # Remove event to prevent accumulation
+        # Remove event to prevent accumulation (no-op on timeout).
         try {
-            Remove-Event -SourceIdentifier "KeyboardEvent"
+            Remove-Event -SourceIdentifier "KeyboardEvent" -ErrorAction SilentlyContinue
         } catch {
             Write-Host "Error removing event: $_"
             Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1009 -Message "Error removing event: $_"
         }
 
-        Write-Host "Keyboard event received..."
+        # Detect a display wake-up: the user was idle long enough for the screen to
+        # sleep (so the monitor jumped to the other input on its own) and is now
+        # active again. Reapply the current mode silently to force the right input.
+        try {
+            $currentIdleSec = [IdleInfo]::GetIdleSeconds()
+            if ($global:previousIdleSec -ge $global:displaySleepThresholdSec -and $currentIdleSec -lt $global:previousIdleSec) {
+                Write-Host "DISPLAY WAKE DETECTED - reapplying current mode"
+                if ($global:keyboardConnected) {
+                    SwitchToModeA -Silent
+                } else {
+                    SwitchToModeB -Silent
+                }
+            }
+            $global:previousIdleSec = $currentIdleSec
+        } catch {
+            Write-Host "Error handling display wake: $_"
+            Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1013 -Message "Error handling display wake: $_"
+        }
 
         try {
             $newState = IsConnected
