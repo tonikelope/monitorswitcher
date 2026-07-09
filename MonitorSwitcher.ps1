@@ -1,6 +1,14 @@
-# Load notification module
-Import-Module BurntToast
+param(
+    # Show a toast notification each time the mode changes. Off by default.
+    [switch]$ShowNotifications
+)
 
+# Load notification module only when notifications are enabled.
+if ($ShowNotifications) {
+    Import-Module BurntToast
+}
+
+$global:showNotifications = [bool]$ShowNotifications
 $global:icon = Join-Path $PSScriptRoot "MonitorDual.png"
 
 $global:keyboardId = "VID_046D&PID_C31C" # Use this in PowerShell -> Get-PnpDevice -Class "USB" | Select-Object Name, InstanceId
@@ -19,11 +27,38 @@ $global:keyboardConnected = $false
 $global:logName = "Application"
 $global:source = "MonitorSwitcher"
 
+# Reads Windows' "turn off display" timeout (VIDEOIDLE) from the active power plan,
+# so the wake-up detection adapts automatically to whatever the system is set to.
+# Picks the AC or DC value depending on how the machine is currently powered.
+# Falls back to 900s if it can't be read or the display is set to never turn off.
+function GetDisplaySleepThresholdSec {
+    param([int]$Fallback = 900)
+    try {
+        $out = powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 2>$null
+        # The output lists several hex values (min, max, increment, AC index, DC
+        # index). The two we want are the last ones: AC (second to last) and DC.
+        $hex = [regex]::Matches(($out -join "`n"), '0x[0-9a-fA-F]+') | ForEach-Object { $_.Value }
+        if ($hex.Count -lt 2) { return $Fallback }
+
+        $onBattery = $false
+        try {
+            $bat = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+            if ($bat) { $onBattery = ($bat.BatteryStatus -ne 2) } # 2 = plugged in
+        } catch {}
+
+        $sec = if ($onBattery) { [Convert]::ToInt32($hex[-1], 16) } else { [Convert]::ToInt32($hex[-2], 16) }
+        if ($sec -le 0) { return $Fallback } # 0 = "Never", so keep the fallback
+        return $sec
+    } catch {
+        return $Fallback
+    }
+}
+
 # When the screen sleeps by inactivity the monitor loses signal and jumps to the
-# other input on its own. Set this to your Windows "turn off display" timeout (in
-# seconds). When the user comes back after being idle at least this long, the
-# script reapplies the current mode so the monitor switches back to the right input.
-$global:displaySleepThresholdSec = 900
+# other input on its own. When the user comes back after being idle at least this
+# long, the script reapplies the current mode so the monitor switches back to the
+# right input. Read from the system so it matches the real display-off timeout.
+$global:displaySleepThresholdSec = GetDisplaySleepThresholdSec
 # How often (seconds) the loop wakes up to poll for a screen wake-up.
 $global:pollIntervalSec = 2
 
@@ -60,7 +95,7 @@ try {
 function SwitchToModeA {
     param([switch]$Silent)
     try {
-        if (-not $Silent) {
+        if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         }
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeA_monitor_output_id
@@ -74,7 +109,7 @@ function SwitchToModeA {
 function SwitchToModeB {
     param([switch]$Silent)
     try {
-        if (-not $Silent) {
+        if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
         }
         & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeB_monitor_output_id
