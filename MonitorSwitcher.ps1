@@ -92,14 +92,41 @@ try {
 	Write-Host "Error creating event source"
 }
 
+# Read the monitor's current input (VCP feature 60). ControlMyMonitor is a GUI
+# app, so it must be run with Start-Process -Wait to get its exit code, which
+# carries the value. Returns $null if it can't be read.
+function GetMonitorInput {
+    param([string]$MonitorId)
+    try {
+        $p = Start-Process -FilePath $global:controlMyMonitor -ArgumentList '/GetValue', $MonitorId, '60' -Wait -PassThru -WindowStyle Hidden
+        return $p.ExitCode
+    } catch {
+        Write-Host "Error reading monitor input: $_"
+        return $null
+    }
+}
+
+# Safety control: only switch a monitor's input when it isn't already there.
+# Re-selecting the same input makes the monitor flicker, so we skip the SetValue
+# when the current input already matches. On any doubt (can't read the value) we
+# still apply, so correctness wins over avoiding a flicker.
+function SetMonitorInput {
+    param([string]$MonitorId, [int]$TargetOutputId)
+    if ((GetMonitorInput $MonitorId) -eq $TargetOutputId) {
+        return $false
+    }
+    & $global:controlMyMonitor /SetValue $MonitorId 60 $TargetOutputId
+    return $true
+}
+
 function SwitchToModeA {
     param([switch]$Silent)
     try {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         }
-        & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeA_monitor_output_id
-        & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeA_monitor2_output_id
+        SetMonitorInput $global:monitorId $global:modeA_monitor_output_id | Out-Null
+        SetMonitorInput $global:monitor2Id $global:modeA_monitor2_output_id | Out-Null
     } catch {
         Write-Host "Error switching to Mode A: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1001 -Message "Error switching to Mode A: $_"
@@ -112,8 +139,8 @@ function SwitchToModeB {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
         }
-        & $global:controlMyMonitor /SetValue $global:monitorId 60 $global:modeB_monitor_output_id
-        & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $global:modeB_monitor2_output_id
+        SetMonitorInput $global:monitorId $global:modeB_monitor_output_id | Out-Null
+        SetMonitorInput $global:monitor2Id $global:modeB_monitor2_output_id | Out-Null
     } catch {
         Write-Host "Error switching to Mode B: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1002 -Message "Error switching to Mode B: $_"
