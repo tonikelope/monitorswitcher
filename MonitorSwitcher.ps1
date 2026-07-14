@@ -93,8 +93,8 @@ try {
 }
 
 # Read the monitor's current input (VCP feature 60). ControlMyMonitor is a GUI
-# app, so it must be run with Start-Process -Wait to get its exit code, which
-# carries the value. Returns $null if it can't be read.
+# app, so Start-Process -Wait is required to get its exit code, which carries the
+# value. Returns the exit code, or $null on error.
 function GetMonitorInput {
     param([string]$MonitorId)
     try {
@@ -106,17 +106,26 @@ function GetMonitorInput {
     }
 }
 
-# Safety control: only switch a monitor's input when it isn't already there.
-# Re-selecting the same input makes the monitor flicker, so we skip the SetValue
-# when the current input already matches. On any doubt (can't read the value) we
-# still apply, so correctness wins over avoiding a flicker.
-function SetMonitorInput {
-    param([string]$MonitorId, [int]$TargetOutputId)
-    if ((GetMonitorInput $MonitorId) -eq $TargetOutputId) {
-        return $false
+# Apply the target inputs to both monitors, fire-and-forget for maximum speed.
+#
+# -SkipIfCurrent adds the safety control (read each input first and skip the ones
+# already on target, to avoid a redundant switch / flicker). Reading is slow
+# (~1s per monitor to launch ControlMyMonitor), so it's used ONLY where the
+# flicker actually matters: the wake reapply, which isn't interactive and where
+# the monitor is powering on anyway. A real KVM switch always changes the input
+# (mode A <-> B), so there's nothing to skip and we write straight away, snappy.
+# Reads happen BEFORE any write, so a read never overlaps a write on the bus.
+function ApplyMode {
+    param([int]$Target1, [int]$Target2, [switch]$SkipIfCurrent)
+    if ($SkipIfCurrent) {
+        $need1 = (GetMonitorInput $global:monitorId)  -ne $Target1
+        $need2 = (GetMonitorInput $global:monitor2Id) -ne $Target2
+    } else {
+        $need1 = $true
+        $need2 = $true
     }
-    & $global:controlMyMonitor /SetValue $MonitorId 60 $TargetOutputId
-    return $true
+    if ($need1) { & $global:controlMyMonitor /SetValue $global:monitorId 60 $Target1 }
+    if ($need2) { & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $Target2 }
 }
 
 function SwitchToModeA {
@@ -125,8 +134,7 @@ function SwitchToModeA {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         }
-        SetMonitorInput $global:monitorId $global:modeA_monitor_output_id | Out-Null
-        SetMonitorInput $global:monitor2Id $global:modeA_monitor2_output_id | Out-Null
+        ApplyMode $global:modeA_monitor_output_id $global:modeA_monitor2_output_id -SkipIfCurrent:$Silent
     } catch {
         Write-Host "Error switching to Mode A: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1001 -Message "Error switching to Mode A: $_"
@@ -139,8 +147,7 @@ function SwitchToModeB {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
         }
-        SetMonitorInput $global:monitorId $global:modeB_monitor_output_id | Out-Null
-        SetMonitorInput $global:monitor2Id $global:modeB_monitor2_output_id | Out-Null
+        ApplyMode $global:modeB_monitor_output_id $global:modeB_monitor2_output_id -SkipIfCurrent:$Silent
     } catch {
         Write-Host "Error switching to Mode B: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1002 -Message "Error switching to Mode B: $_"
