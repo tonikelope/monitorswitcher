@@ -111,8 +111,9 @@ function GetMonitorInput {
 # -SkipIfCurrent adds the safety control (read each input first and skip the ones
 # already on target, to avoid a redundant switch / flicker). Reading is slow
 # (~1s per monitor to launch ControlMyMonitor), so it's used ONLY where the
-# flicker actually matters: the wake reapply, which isn't interactive and where
-# the monitor is powering on anyway. A real KVM switch always changes the input
+# flicker matters and latency doesn't: the initial setup (the monitor may already
+# be on the target input) and the wake reapply (not interactive, monitor is
+# powering on anyway). A real interactive KVM switch always changes the input
 # (mode A <-> B), so there's nothing to skip and we write straight away, snappy.
 # Reads happen BEFORE any write, so a read never overlaps a write on the bus.
 function ApplyMode {
@@ -129,12 +130,12 @@ function ApplyMode {
 }
 
 function SwitchToModeA {
-    param([switch]$Silent)
+    param([switch]$Silent, [switch]$SkipIfCurrent)
     try {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
         }
-        ApplyMode $global:modeA_monitor_output_id $global:modeA_monitor2_output_id -SkipIfCurrent:$Silent
+        ApplyMode $global:modeA_monitor_output_id $global:modeA_monitor2_output_id -SkipIfCurrent:$SkipIfCurrent
     } catch {
         Write-Host "Error switching to Mode A: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1001 -Message "Error switching to Mode A: $_"
@@ -142,12 +143,12 @@ function SwitchToModeA {
 }
 
 function SwitchToModeB {
-    param([switch]$Silent)
+    param([switch]$Silent, [switch]$SkipIfCurrent)
     try {
         if ($global:showNotifications -and -not $Silent) {
             New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
         }
-        ApplyMode $global:modeB_monitor_output_id $global:modeB_monitor2_output_id -SkipIfCurrent:$Silent
+        ApplyMode $global:modeB_monitor_output_id $global:modeB_monitor2_output_id -SkipIfCurrent:$SkipIfCurrent
     } catch {
         Write-Host "Error switching to Mode B: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1002 -Message "Error switching to Mode B: $_"
@@ -179,9 +180,9 @@ try {
 try {
     $global:keyboardConnected = IsConnected
     if ($global:keyboardConnected) {
-        SwitchToModeA
+        SwitchToModeA -SkipIfCurrent
     } else {
-        SwitchToModeB
+        SwitchToModeB -SkipIfCurrent
     }
 } catch {
     Write-Host "Error setting up initial state: $_"
@@ -229,9 +230,9 @@ try {
             if ($global:previousIdleSec -ge $global:displaySleepThresholdSec -and $currentIdleSec -lt $global:previousIdleSec) {
                 Write-Host "DISPLAY WAKE DETECTED - reapplying current mode"
                 if ($global:keyboardConnected) {
-                    SwitchToModeA -Silent
+                    SwitchToModeA -Silent -SkipIfCurrent
                 } else {
-                    SwitchToModeB -Silent
+                    SwitchToModeB -Silent -SkipIfCurrent
                 }
             }
             $global:previousIdleSec = $currentIdleSec
