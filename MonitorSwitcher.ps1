@@ -11,7 +11,7 @@ if ($ShowNotifications) {
 $global:showNotifications = [bool]$ShowNotifications
 $global:icon = Join-Path $PSScriptRoot "MonitorDual.png"
 
-$global:keyboardId = "VID_046D&PID_C31C" # Use this in PowerShell -> Get-PnpDevice -Class "USB" | Select-Object Name, InstanceId
+$global:keyboardId = "VID_1532&PID_02A2" # Razer Ornata V3 X; verify with Get-PnpDevice -Class Keyboard
 $global:monitorId = "\\.\DISPLAY1\Monitor0" # Get this from ControlMyMonitor
 $global:monitor2Id = "\\.\DISPLAY2\Monitor0" # Get this from ControlMyMonitor
 $global:modeA_monitor_output_id = 15 #HDMI, DP, ETC... Get this from ControlMyMonitor
