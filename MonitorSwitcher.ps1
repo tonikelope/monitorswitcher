@@ -157,10 +157,10 @@ function SwitchToModeB {
 
 function IsConnected {
     try {
-        $dev = Get-PnpDevice -Class Keyboard | Where-Object { 
-            $_.InstanceId -like "*$global:keyboardId*" -and $_.Status -eq "OK" 
-        }
-        return $dev -ne $null
+        $dev = @(Get-PnpDevice -Class Keyboard | Where-Object {
+            $_.InstanceId -like "*$global:keyboardId*" -and $_.Status -eq "OK"
+        })
+        return $dev.Count -gt 0
     } catch {
         Write-Host "Error checking if keyboard is connected: $_"
         Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1003 -Message "Error checking if keyboard is connected: $_"
