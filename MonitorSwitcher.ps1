@@ -1,270 +1,349 @@
+[CmdletBinding()]
 param(
-    # Show a toast notification each time the mode changes. Off by default.
+    # Show a toast notification on startup and when the keyboard changes mode.
     [switch]$ShowNotifications
 )
 
-# Load notification module only when notifications are enabled.
-if ($ShowNotifications) {
-    Import-Module BurntToast
-}
+$script:keyboardId = 'VID_1532&PID_02A2' # Razer Ornata V3 X
+$script:monitors = @(
+    @{ Id = '\\.\DISPLAY1\Monitor0'; ModeA = 15; ModeB = 17 }
+    @{ Id = '\\.\DISPLAY2\Monitor0'; ModeA = 15; ModeB = 17 }
+)
+$script:controlMyMonitor = Join-Path $PSScriptRoot 'ControlMyMonitor.exe'
+$script:icon = Join-Path $PSScriptRoot 'MonitorDual.png'
+$script:showNotifications = [bool]$ShowNotifications
+$script:eventLogAvailable = $false
+$script:keyboardQueryFailed = $false
+$script:displayPower = $null
+$script:lastWakeGeneration = 0L
+$script:keyboardConnected = $null
+$script:recovery = $null
+$script:clock = [Diagnostics.Stopwatch]::StartNew()
 
-$global:showNotifications = [bool]$ShowNotifications
-$global:icon = Join-Path $PSScriptRoot "MonitorDual.png"
-
-$global:keyboardId = "VID_1532&PID_02A2" # Razer Ornata V3 X; verify with Get-PnpDevice -Class Keyboard
-$global:monitorId = "\\.\DISPLAY1\Monitor0" # Get this from ControlMyMonitor
-$global:monitor2Id = "\\.\DISPLAY2\Monitor0" # Get this from ControlMyMonitor
-$global:modeA_monitor_output_id = 15 #HDMI, DP, ETC... Get this from ControlMyMonitor
-$global:modeA_monitor2_output_id = 15 #HDMI, DP, ETC... Get this from ControlMyMonitor
-$global:modeB_monitor_output_id = 17 #HDMI, DP, ETC... Get this from ControlMyMonitor
-$global:modeB_monitor2_output_id = 17 #HDMI, DP, ETC... Get this from ControlMyMonitor
-
-
-$global:modeA_msg = "MODE A ENABLED"
-$global:modeB_msg = "MODE B ENABLED"
-$global:controlMyMonitor = Join-Path $PSScriptRoot "ControlMyMonitor.exe"
-$global:keyboardConnected = $false
-$global:logName = "Application"
-$global:source = "MonitorSwitcher"
-
-# Reads Windows' "turn off display" timeout (VIDEOIDLE) from the active power plan,
-# so the wake-up detection adapts automatically to whatever the system is set to.
-# Picks the AC or DC value depending on how the machine is currently powered.
-# Falls back to 900s if it can't be read or the display is set to never turn off.
-function GetDisplaySleepThresholdSec {
-    param([int]$Fallback = 900)
-    try {
-        $out = powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE 2>$null
-        # The output lists several hex values (min, max, increment, AC index, DC
-        # index). The two we want are the last ones: AC (second to last) and DC.
-        $hex = [regex]::Matches(($out -join "`n"), '0x[0-9a-fA-F]+') | ForEach-Object { $_.Value }
-        if ($hex.Count -lt 2) { return $Fallback }
-
-        $onBattery = $false
-        try {
-            $bat = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
-            if ($bat) { $onBattery = ($bat.BatteryStatus -ne 2) } # 2 = plugged in
-        } catch {}
-
-        $sec = if ($onBattery) { [Convert]::ToInt32($hex[-1], 16) } else { [Convert]::ToInt32($hex[-2], 16) }
-        if ($sec -le 0) { return $Fallback } # 0 = "Never", so keep the fallback
-        return $sec
-    } catch {
-        return $Fallback
-    }
-}
-
-# When the screen sleeps by inactivity the monitor loses signal and jumps to the
-# other input on its own. When the user comes back after being idle at least this
-# long, the script reapplies the current mode so the monitor switches back to the
-# right input. Read from the system so it matches the real display-off timeout.
-$global:displaySleepThresholdSec = GetDisplaySleepThresholdSec
-# How often (seconds) the loop wakes up to poll for a screen wake-up.
-$global:pollIntervalSec = 2
-
-# P/Invoke to read how long the user has been idle (no keyboard/mouse input).
-Add-Type @"
+function Start-DisplayPowerMonitor {
+    if (-not ('MonitorSwitcher.DisplayPowerMonitor' -as [type])) {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
-public static class IdleInfo {
-    [StructLayout(LayoutKind.Sequential)]
-    struct LASTINPUTINFO {
-        public uint cbSize;
-        public uint dwTime;
-    }
-    [DllImport("user32.dll")]
-    static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-    public static uint GetIdleSeconds() {
-        LASTINPUTINFO lii = new LASTINPUTINFO();
-        lii.cbSize = (uint)Marshal.SizeOf(lii);
-        if (!GetLastInputInfo(ref lii)) { return 0; }
-        return (uint)(((uint)Environment.TickCount - lii.dwTime) / 1000);
+
+namespace MonitorSwitcher {
+    public sealed class DisplayPowerMonitor : IDisposable {
+        private const uint DeviceNotifyCallback = 2;
+        private const uint PowerSettingChange = 0x8013;
+        private static readonly Guid SessionDisplayStatus = new Guid("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5");
+
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        private delegate uint DeviceNotify(IntPtr context, uint type, IntPtr setting);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Subscription {
+            public DeviceNotify Callback;
+            public IntPtr Context;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DisplaySetting {
+            public Guid Id;
+            public uint DataLength;
+            public int State;
+        }
+
+        [DllImport("powrprof.dll", ExactSpelling = true)]
+        private static extern uint PowerSettingRegisterNotification(ref Guid setting, uint flags,
+            ref Subscription subscription, out IntPtr handle);
+
+        [DllImport("powrprof.dll", ExactSpelling = true)]
+        private static extern uint PowerSettingUnregisterNotification(IntPtr handle);
+
+        public struct Snapshot {
+            public int State;
+            public long WakeGeneration;
+        }
+
+        private readonly object gate = new object();
+        private readonly DeviceNotify callback;
+        private IntPtr handle;
+        private Snapshot snapshot = new Snapshot { State = -1 };
+        private bool wasOff;
+
+        public DisplayPowerMonitor() {
+            callback = OnPowerSettingChanged;
+            var subscription = new Subscription { Callback = callback };
+            Guid setting = SessionDisplayStatus;
+            uint result = PowerSettingRegisterNotification(ref setting, DeviceNotifyCallback, ref subscription, out handle);
+            if (result != 0) { throw new Win32Exception((int)result); }
+        }
+
+        private uint OnPowerSettingChanged(IntPtr context, uint type, IntPtr setting) {
+            if (type != PowerSettingChange || setting == IntPtr.Zero) { return 0; }
+            var id = (Guid)Marshal.PtrToStructure(setting, typeof(Guid));
+            uint length = unchecked((uint)Marshal.ReadInt32(setting, 16));
+            if (id != SessionDisplayStatus || length != 4) { return 0; }
+            var update = (DisplaySetting)Marshal.PtrToStructure(setting, typeof(DisplaySetting));
+            if (update.State < 0 || update.State > 2) { return 0; }
+            lock (gate) {
+                snapshot.State = update.State;
+                if (update.State == 0) { wasOff = true; }
+                if (update.State == 1 && wasOff) {
+                    wasOff = false;
+                    snapshot.WakeGeneration++;
+                }
+            }
+            return 0;
+        }
+
+        public Snapshot Read() {
+            lock (gate) { return snapshot; }
+        }
+
+        public void Dispose() {
+            if (handle != IntPtr.Zero) {
+                uint result = PowerSettingUnregisterNotification(handle);
+                if (result != 0) { throw new Win32Exception((int)result); }
+                handle = IntPtr.Zero;
+            }
+            GC.KeepAlive(callback);
+        }
     }
 }
-"@
-
-try {
-    # Create event source if it doesn't exist
-	if (-not (Get-EventLog -LogName $global:logName | Where-Object { $_.Source -eq $global:source })) {
-		New-EventLog -LogName $global:logName -Source $global:source
-	}
-} catch {
-	Write-Host "Error creating event source"
+'@
+    }
+    return [MonitorSwitcher.DisplayPowerMonitor]::new()
 }
 
-# Read the monitor's current input (VCP feature 60). ControlMyMonitor is a GUI
-# app, so Start-Process -Wait is required to get its exit code, which carries the
-# value. Returns the exit code, or $null on error.
-function GetMonitorInput {
-    param([string]$MonitorId)
+function Get-DisplayStatus {
+    if ($null -ne $script:displayPower) { return $script:displayPower.Read() }
+    return @{ State = -1; WakeGeneration = 0L }
+}
+
+function Write-SwitcherWarning {
+    param([int]$EventId, [string]$Message)
+    Write-Warning $Message
+    if ($script:eventLogAvailable) {
+        Write-EventLog -LogName Application -Source MonitorSwitcher -EntryType Warning -EventId $EventId -Message $Message -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-KeyboardConnection {
     try {
-        $p = Start-Process -FilePath $global:controlMyMonitor -ArgumentList '/GetValue', $MonitorId, '60' -Wait -PassThru -WindowStyle Hidden
-        return $p.ExitCode
+        $devices = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPClass = 'Keyboard' AND Present = TRUE" -ErrorAction Stop)
+        $script:keyboardQueryFailed = $false
+        return @($devices | Where-Object PNPDeviceID -Like "*$script:keyboardId*").Count -gt 0
     } catch {
-        Write-Host "Error reading monitor input: $_"
+        if (-not $script:keyboardQueryFailed) {
+            Write-SwitcherWarning 1003 "Could not check keyboard presence: $_"
+            $script:keyboardQueryFailed = $true
+        }
         return $null
     }
 }
 
-# Apply the target inputs to both monitors, fire-and-forget for maximum speed.
-#
-# -SkipIfCurrent adds the safety control (read each input first and skip the ones
-# already on target, to avoid a redundant switch / flicker). Reading is slow
-# (~1s per monitor to launch ControlMyMonitor), so it's used ONLY where the
-# flicker matters and latency doesn't: the initial setup (the monitor may already
-# be on the target input) and the wake reapply (not interactive, monitor is
-# powering on anyway). A real interactive KVM switch always changes the input
-# (mode A <-> B), so there's nothing to skip and we write straight away, snappy.
-# Reads happen BEFORE any write, so a read never overlaps a write on the bus.
-function ApplyMode {
-    param([int]$Target1, [int]$Target2, [switch]$SkipIfCurrent)
-    if ($SkipIfCurrent) {
-        $need1 = (GetMonitorInput $global:monitorId)  -ne $Target1
-        $need2 = (GetMonitorInput $global:monitor2Id) -ne $Target2
-    } else {
-        $need1 = $true
-        $need2 = $true
-    }
-    if ($need1) { & $global:controlMyMonitor /SetValue $global:monitorId 60 $Target1 }
-    if ($need2) { & $global:controlMyMonitor /SetValue $global:monitor2Id 60 $Target2 }
-}
+function Invoke-ControlMyMonitor {
+    param([string]$Arguments)
 
-function SwitchToModeA {
-    param([switch]$Silent, [switch]$SkipIfCurrent)
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo.FileName = $script:controlMyMonitor
+    $process.StartInfo.Arguments = $Arguments
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
     try {
-        if ($global:showNotifications -and -not $Silent) {
-            New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeA_msg
+        [void]$process.Start()
+        if (-not $process.WaitForExit(2500)) {
+            if (-not $process.HasExited) { $process.Kill() }
+            [void]$process.WaitForExit(500)
+            Write-Verbose "ControlMyMonitor timed out: $Arguments"
+            return $null
         }
-        ApplyMode $global:modeA_monitor_output_id $global:modeA_monitor2_output_id -SkipIfCurrent:$SkipIfCurrent
+        return $process.ExitCode
     } catch {
-        Write-Host "Error switching to Mode A: $_"
-        Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1001 -Message "Error switching to Mode A: $_"
+        Write-Verbose "ControlMyMonitor failed ($Arguments): $_"
+        return $null
+    } finally {
+        $process.Dispose()
     }
 }
 
-function SwitchToModeB {
-    param([switch]$Silent, [switch]$SkipIfCurrent)
-    try {
-        if ($global:showNotifications -and -not $Silent) {
-            New-BurntToastNotification -AppLogo $global:icon -Text "MonitorSwitcher (by tonikelope)", $global:modeB_msg
-        }
-        ApplyMode $global:modeB_monitor_output_id $global:modeB_monitor2_output_id -SkipIfCurrent:$SkipIfCurrent
-    } catch {
-        Write-Host "Error switching to Mode B: $_"
-        Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1002 -Message "Error switching to Mode B: $_"
+function Set-MonitorInput {
+    param([string]$MonitorId, [int]$Target)
+    $result = Invoke-ControlMyMonitor ('/SetValue "{0}" 60 {1}' -f $MonitorId, $Target)
+    if ($null -eq $result -or $result -ne 0) {
+        Write-SwitcherWarning 1001 "Input switch to $Target could not be confirmed for $MonitorId (exit: $result)."
     }
 }
 
-function IsConnected {
-    try {
-        $dev = @(Get-PnpDevice -Class Keyboard | Where-Object {
-            $_.InstanceId -like "*$global:keyboardId*" -and $_.Status -eq "OK"
-        })
-        return $dev.Count -gt 0
-    } catch {
-        Write-Host "Error checking if keyboard is connected: $_"
-        Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1003 -Message "Error checking if keyboard is connected: $_"
-        return $false
-    }
-}
-
-# Initial cleanup
-try {
-    Get-EventSubscriber | Where-Object { $_.SourceIdentifier -match "KeyboardEvent" } | Unregister-Event -ErrorAction SilentlyContinue
-} catch {
-    Write-Host "Error cleaning up previous events: $_"
-    Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1005 -Message "Error cleaning up previous events: $_"
-}
-
-# Initial setup
-try {
-    $global:keyboardConnected = IsConnected
-    if ($global:keyboardConnected) {
-        SwitchToModeA -SkipIfCurrent
-    } else {
-        SwitchToModeB -SkipIfCurrent
-    }
-} catch {
-    Write-Host "Error setting up initial state: $_"
-    Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1006 -Message "Error setting up initial state: $_"
-}
-
-# Use event only as a signal
-try {
-    Register-WmiEvent -Class Win32_DeviceChangeEvent -SourceIdentifier "KeyboardEvent"
-} catch {
-    Write-Host "Error registering WMI event: $_"
-    Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1007 -Message "Error registering WMI event: $_"
-    exit 1
-}
-
-Write-Host "Keyboard status monitor started. Waiting for events..."
-
-$global:previousIdleSec = [IdleInfo]::GetIdleSeconds()
-
-try {
-    while ($true) {
-        # Poll with a timeout so we can also detect display wake-ups (which don't
-        # raise any device event). A keyboard event just makes this return sooner.
+function Show-ModeNotification {
+    param([bool]$KeyboardConnected)
+    if ($script:showNotifications) {
+        $mode = if ($KeyboardConnected) { 'A' } else { 'B' }
         try {
-            Wait-Event -SourceIdentifier "KeyboardEvent" -Timeout $global:pollIntervalSec | Out-Null
+            New-BurntToastNotification -AppLogo $script:icon -Text 'MonitorSwitcher (by tonikelope)', "MODE $mode ENABLED" -ErrorAction Stop
         } catch {
-            Write-Host "Error waiting for event: $_"
-            Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1008 -Message "Error waiting for event: $_"
-            break
+            Write-SwitcherWarning 1014 "Could not show mode notification: $_"
         }
+    }
+}
 
-        # Remove event to prevent accumulation (no-op on timeout).
-        try {
-            Remove-Event -SourceIdentifier "KeyboardEvent" -ErrorAction SilentlyContinue
-        } catch {
-            Write-Host "Error removing event: $_"
-            Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1009 -Message "Error removing event: $_"
-        }
-
-        # Detect a display wake-up: the user was idle long enough for the screen to
-        # sleep (so the monitor jumped to the other input on its own) and is now
-        # active again. Reapply the current mode silently to force the right input.
-        try {
-            $currentIdleSec = [IdleInfo]::GetIdleSeconds()
-            if ($global:previousIdleSec -ge $global:displaySleepThresholdSec -and $currentIdleSec -lt $global:previousIdleSec) {
-                Write-Host "DISPLAY WAKE DETECTED - reapplying current mode"
-                if ($global:keyboardConnected) {
-                    SwitchToModeA -Silent -SkipIfCurrent
-                } else {
-                    SwitchToModeB -Silent -SkipIfCurrent
-                }
+function New-InputRecovery {
+    param([long]$WakeGeneration)
+    $now = $script:clock.ElapsedMilliseconds
+    return @{
+        WakeGeneration = $WakeGeneration
+        Due = $now + 1200
+        Deadline = $now + 12000
+        Pending = @(
+            foreach ($monitor in $script:monitors) {
+                @{ Monitor = $monitor; SawAlternate = $false; Done = $false }
             }
-            $global:previousIdleSec = $currentIdleSec
-        } catch {
-            Write-Host "Error handling display wake: $_"
-            Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1013 -Message "Error handling display wake: $_"
-        }
-
-        try {
-            $newState = IsConnected
-            if ($newState -ne $global:keyboardConnected) {
-                Write-Host "STATE CHANGE DETECTED"
-                $global:keyboardConnected = $newState
-                if ($newState) {
-                    SwitchToModeA
-                } else {
-                    SwitchToModeB
-                }
-            }
-        } catch {
-            Write-Host "Error checking or switching keyboard state: $_"
-            Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1010 -Message "Error checking or switching keyboard state: $_"
-        }
-    }
-} catch {
-    Write-Host "Error in main loop: $_"
-    Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1011 -Message "Error in main loop: $_"
-} finally {
-    try {
-        Get-EventSubscriber | Where-Object { $_.SourceIdentifier -match "KeyboardEvent" } | Unregister-Event -ErrorAction SilentlyContinue
-    } catch {
-        Write-Host "Error cleaning up events at the end: $_"
-        Write-EventLog -LogName $global:logName -Source $global:source -EntryType Error -EventId 1012 -Message "Error cleaning up events at the end: $_"
+        )
     }
 }
+
+function Test-RecoveryDisplay {
+    param($Recovery)
+    $display = Get-DisplayStatus
+    return ($script:clock.ElapsedMilliseconds -lt $Recovery.Deadline -and
+        $display.WakeGeneration -eq $Recovery.WakeGeneration -and
+        ($display.State -eq 1 -or ($display.State -eq -1 -and $Recovery.WakeGeneration -eq 0)))
+}
+
+function Invoke-InputRecovery {
+    param($Recovery, [bool]$KeyboardConnected)
+    if ($script:clock.ElapsedMilliseconds -lt $Recovery.Due) { return }
+
+    foreach ($pending in $Recovery.Pending) {
+        if ($pending.Done) { continue }
+        if (-not (Test-RecoveryDisplay $Recovery)) { return }
+        $monitor = $pending.Monitor
+        $target = if ($KeyboardConnected) { $monitor.ModeA } else { $monitor.ModeB }
+        $alternate = if ($KeyboardConnected) { $monitor.ModeB } else { $monitor.ModeA }
+        $inputCode = Invoke-ControlMyMonitor ('/GetValue "{0}" 60' -f $monitor.Id)
+        if ($inputCode -eq $target) {
+            $pending.Done = $true
+        } elseif ($inputCode -eq $alternate) {
+            # A valid alternate must survive a second read in a later pass.
+            if ($pending.SawAlternate) {
+                $currentKeyboard = Get-KeyboardConnection
+                if ($null -eq $currentKeyboard -or $currentKeyboard -ne $KeyboardConnected) { return }
+                if (-not (Test-RecoveryDisplay $Recovery)) { return }
+                $pending.Done = $true
+                Set-MonitorInput $monitor.Id $target
+            }
+            $pending.SawAlternate = $true
+        } else {
+            # A missing, failed or unconfigured read cannot authorize a write.
+            $pending.SawAlternate = $false
+        }
+    }
+
+    $Recovery.Due = $script:clock.ElapsedMilliseconds + 750
+    if (@($Recovery.Pending | Where-Object { -not $_.Done }).Count -eq 0) {
+        $script:recovery = $null
+    }
+}
+
+function Update-MonitorSwitcher {
+    $keyboard = Get-KeyboardConnection
+    $keyboardChanged = $false
+    if ($null -ne $keyboard -and $null -ne $script:keyboardConnected -and $keyboard -ne $script:keyboardConnected) {
+        # Ignore a single transient USB re-enumeration or failed presence query.
+        Start-Sleep -Milliseconds 250
+        $confirmed = Get-KeyboardConnection
+        if ($null -eq $confirmed -or $confirmed -ne $keyboard) { $keyboard = $null }
+        else { $keyboardChanged = $true }
+    }
+
+    # Read display state after the debounce in case the same USB event woke it.
+    $display = Get-DisplayStatus
+    if ($display.WakeGeneration -ne $script:lastWakeGeneration) {
+        $script:lastWakeGeneration = $display.WakeGeneration
+        $script:recovery = New-InputRecovery $display.WakeGeneration
+        Write-Verbose "Display wake $($display.WakeGeneration) detected."
+    }
+
+    if ($script:recovery -and $script:clock.ElapsedMilliseconds -ge $script:recovery.Deadline) {
+        $pendingIds = @($script:recovery.Pending | Where-Object { -not $_.Done } | ForEach-Object { $_.Monitor.Id })
+        Write-Verbose "Input recovery expired for $($pendingIds -join ', ')."
+        $script:recovery = $null
+    }
+    if ($null -eq $keyboard) { return }
+
+    if ($null -eq $script:keyboardConnected) {
+        $script:keyboardConnected = $keyboard
+        if ($display.WakeGeneration -eq 0) { $script:recovery = New-InputRecovery 0 }
+        Show-ModeNotification $keyboard
+    } elseif ($keyboardChanged) {
+        $script:keyboardConnected = $keyboard
+        if ($script:recovery -and $script:recovery.WakeGeneration -gt 0) {
+            # Keep one guarded recovery for the new mode. Old readings no longer apply.
+            foreach ($pending in $script:recovery.Pending) {
+                $pending.SawAlternate = $false
+                $pending.Done = $false
+            }
+        } else {
+            $script:recovery = $null
+            foreach ($monitor in $script:monitors) {
+                if ($monitor.ModeA -eq $monitor.ModeB) { continue }
+                $target = if ($keyboard) { $monitor.ModeA } else { $monitor.ModeB }
+                Set-MonitorInput $monitor.Id $target
+            }
+        }
+        Show-ModeNotification $keyboard
+    }
+
+    if ($script:recovery) { Invoke-InputRecovery $script:recovery $keyboard }
+}
+
+function Start-MonitorSwitcher {
+    $created = $false
+    $instance = [Threading.Mutex]::new($true, 'Local\MonitorSwitcher', [ref]$created)
+    $deviceEvent = 'MonitorSwitcher.DeviceChange'
+    try {
+        if (-not $created) { return }
+        if (-not (Test-Path -LiteralPath $script:controlMyMonitor -PathType Leaf)) {
+            throw "ControlMyMonitor was not found: $script:controlMyMonitor"
+        }
+        if (Get-Command New-EventLog -ErrorAction SilentlyContinue) {
+            try {
+                if (-not [Diagnostics.EventLog]::SourceExists('MonitorSwitcher')) {
+                    New-EventLog -LogName Application -Source MonitorSwitcher -ErrorAction Stop
+                }
+                $script:eventLogAvailable = $true
+            } catch { Write-Verbose "Application log source unavailable: $_" }
+        }
+        if ($script:showNotifications) {
+            try { Import-Module BurntToast -ErrorAction Stop }
+            catch {
+                $script:showNotifications = $false
+                Write-SwitcherWarning 1014 "BurntToast is unavailable: $_"
+            }
+        }
+        try { $script:displayPower = Start-DisplayPowerMonitor }
+        catch { Write-SwitcherWarning 1013 "Display power notifications unavailable: $_" }
+
+        try {
+            Register-CimIndicationEvent -Query 'SELECT * FROM Win32_DeviceChangeEvent WHERE EventType = 2 OR EventType = 3' -SourceIdentifier $deviceEvent -ErrorAction Stop | Out-Null
+        } catch { Write-SwitcherWarning 1007 "Device change notifications unavailable. Polling keyboard presence: $_" }
+
+        while ($true) {
+            Update-MonitorSwitcher
+            $timeout = if ($script:recovery) { 1 } else { 2 }
+            Wait-Event -SourceIdentifier $deviceEvent -Timeout $timeout | Out-Null
+            Remove-Event -SourceIdentifier $deviceEvent -ErrorAction SilentlyContinue
+        }
+    } finally {
+        if ($created) {
+            Unregister-Event -SourceIdentifier $deviceEvent -ErrorAction SilentlyContinue
+            Remove-Event -SourceIdentifier $deviceEvent -ErrorAction SilentlyContinue
+            if ($script:displayPower) {
+                try { $script:displayPower.Dispose() }
+                catch { Write-SwitcherWarning 1013 "Could not release display power notifications: $_" }
+            }
+            $instance.ReleaseMutex()
+        }
+        $instance.Dispose()
+    }
+}
+
+Start-MonitorSwitcher
